@@ -1,0 +1,26 @@
+name: dbmigrator_psql
+description: A PostgreSQL database migration tool for Dart.
+version: 0.1.0
+repository: https://github.com/paschalisp/dbmigrator-psql-dart
+homepage: https://github.com/paschalisp/dbmigrator-psql-dart
+topics:
+  - database
+  - migration
+  - versioning
+  - postgresql
+
+
+environment:
+  sdk: ">=3.10.0 <4.0.0"
+
+
+dependencies:
+  crypto: ^3.0.7
+  postgres: ^3.5.9
+
+  dbmigrator:
+    path: ../dbmigrator-dart
+
+dev_dependencies:
+  lints: ^6.1.0
+  test: ^1.29.0

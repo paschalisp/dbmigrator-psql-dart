@@ -1,0 +1,17 @@
+services:
+  # PostgreSQL database for tests
+  test-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: test_db
+    ports:
+      - "5932:5432"  # non-default port to avoid conflicts
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d test_db"]
+      interval: 2s
+      timeout: 30s
+      retries: 10
+    tmpfs:
+      - /var/lib/postgresql/data  # RAM-backed - fast & ephemeral
