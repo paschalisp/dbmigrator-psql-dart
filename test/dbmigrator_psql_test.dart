@@ -33,7 +33,7 @@ void main() {
       expect(res.direction, MigrationDirection.up);
       expect(
         res.files.names(),
-        containsAllInOrder(['1.2.0_test.sql', '1.2.0_test2.sql', '2.0.0-rc1.sql', '2.0.0.sql']),
+        containsAllInOrder(['1.2.0_test.up.sql', '1.2.0_test2.up.sql', '2.0.0-rc1.up.sql', '2.0.0.up.sql']),
       );
     });
   });
