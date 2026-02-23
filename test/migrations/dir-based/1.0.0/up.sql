@@ -1,1 +1,5 @@
-SELECT 1;
+ALTER TABLE public.table1
+    ADD COLUMN col1 VARCHAR;
+
+ALTER TABLE public.table2
+    ADD COLUMN col1 VARCHAR;

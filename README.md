@@ -1,4 +1,4 @@
-A comprehensive PostgreSQL migration tool in Dart.
+A PostgreSQL database migration library with file-based, versioned schema management supporting both upgrades and downgrades, in Dart.
 
 [![pub package](https://img.shields.io/pub/v/dbmigrator_psql.svg)](https://pub.dev/packages/dbmigrator_psql)
 [![package publisher](https://img.shields.io/pub/publisher/dbmigrator_psql.svg)](https://pub.dev/packages/dbmigrator_psql/publisher)
@@ -15,10 +15,7 @@ void main() async {
   );
 
   final res = await conn.migrator(options: PsqlMigrationOptions(path: './migrations')).migrate(version: '2.0.0');
-
-  print('Migrated from ${result.fromVersion} to ${result.toVersion} (${result.direction.name})');
-  print('Executed files: ${result.files.map((f) => f.name).join(", ")}');
-  print('Duration: ${result.completed.difference(result.started).inSeconds} seconds');
+  print(result.message); // "Migrated from 1.0.0 ➡ 2.0.0 in 3 seconds."
 }
 ```
 

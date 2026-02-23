@@ -1,1 +1,2 @@
-SELECT 1;
+DROP TABLE table2;
+DROP TABLE table1;

@@ -9,5 +9,5 @@ void main() async {
 
   final res = await conn.migrator(options: PsqlMigrationOptions(path: './migrations')).migrate(version: '2.0.0');
 
-  print('Result: ${res.message}'); // Migrated
+  print(res.message); // "Migrated from 1.0.0 ➡ 2.0.0 in 3 seconds."
 }

@@ -1,1 +1,7 @@
-SELECT 1;
+ALTER TABLE table1
+    DROP COLUMN col3;
+
+ALTER TABLE table2
+    DROP COLUMN col3;
+
+DROP TABLE table3;

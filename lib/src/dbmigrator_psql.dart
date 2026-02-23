@@ -83,7 +83,7 @@ class PostgresMigrator with Migratable {
     if (params.isNotEmpty) {
       await ctx.execute(Sql.named(obj as String), parameters: params);
     } else {
-      await ctx.execute(obj);
+      await ctx.execute(obj, queryMode: QueryMode.simple);
     }
   }
 
