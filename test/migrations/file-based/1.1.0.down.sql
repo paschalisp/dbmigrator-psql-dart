@@ -1,0 +1,5 @@
+ALTER TABLE table1
+    DROP COLUMN col2;
+
+ALTER TABLE table2
+    DROP COLUMN col2;

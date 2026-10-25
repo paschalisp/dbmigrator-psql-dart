@@ -1,6 +1,6 @@
 name: dbmigrator_psql
 description: PostgreSQL database migration library with file-based, versioned schema management supporting both upgrades and downgrades.
-version: 0.1.2
+version: 0.2.0
 repository: https://github.com/paschalisp/dbmigrator-psql-dart
 homepage: https://github.com/paschalisp/dbmigrator-psql-dart
 topics:
@@ -16,9 +16,9 @@ environment:
 
 dependencies:
   crypto: ^3.0.7
-  dbmigrator: ^0.1.2
-  postgres: ^3.5.9
+  dbmigrator: ^0.2.0
+  postgres: ^3.5.20
 
 dev_dependencies:
   lints: ^6.1.0
-  test: ^1.29.0
+  test: ^1.33.0

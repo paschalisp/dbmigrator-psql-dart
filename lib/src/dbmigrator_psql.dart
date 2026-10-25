@@ -1,7 +1,6 @@
-import 'dart:convert';
+import 'dart:async';
 import 'dart:io';
 
-import 'package:crypto/crypto.dart';
 import 'package:dbmigrator/dbmigrator.dart';
 import 'package:postgres/postgres.dart';
 
@@ -14,41 +13,48 @@ class PostgresMigrator with Migratable {
   @override
   PsqlMigrationOptions get migrationOptions => options;
 
-  String get versionTable =>
-      options.schema.isNotEmpty ? '${options.schema}.${options.versionTable}' : options.versionTable;
+  /// The schema-qualified and properly quoted version table name.
+  String get versionTable => '"${options.schema}"."${options.versionTable}"';
+
+  /// SQLSTATE codes of transient connection/server-availability errors.
+  static const _retryableCodes = {
+    '08000', // connection_exception
+    '08001', // sqlclient_unable_to_establish_sqlconnection
+    '08003', // connection_does_not_exist
+    '08004', // sqlserver_rejected_establishment_of_sqlconnection
+    '08006', // connection_failure
+    '08007', // transaction_resolution_unknown
+    '08P01', // protocol_violation
+    '53300', // too_many_connections
+    '57P01', // admin_shutdown
+    '57P02', // crash_shutdown
+    '57P03', // cannot_connect_now
+    '57P04', // database_dropped
+    '58030', // io_error
+    '55P03', // lock_not_available (e.g. lock_timeout)
+  };
+
+  // Deadlocks (40P01) and serialization failures (40001) are deliberately not retried:
+  // statements run inside a transaction that is already aborted by the error (25P02),
+  // so retrying a single statement can never succeed. Query cancellation (57014) is
+  // not retried either, as a statement that timed out would simply time out again.
 
   @override
   bool isRetryable(Object error) {
-    if (error is SocketException) return true;
+    // Checked first: the driver's query-cancelled (57014) exception is both a ServerException and a TimeoutException
+    if (error is ServerException) {
+      // Decide by SQLSTATE only. FATAL/PANIC severity alone is not enough, since it also covers
+      // non-transient errors such as authentication failures (28xxx) or a missing database (3D000).
+      return _retryableCodes.contains(error.code);
+    }
+
+    if (error is SocketException || error is TimeoutException || error is HandshakeException) return true;
 
     if (error is PgException) {
-      // Treat "fatal+"-severity errors as connection-related.
-      if ([Severity.fatal, Severity.panic].contains(error.severity)) return true;
-
-      // Try evaluating by error code
-      if (error is ServerException) {
-        return const {
-          '08000', // connection_exception
-          '08003', // connection_does_not_exist
-          '08006', // connection_failure
-          '53300', // too_many_connections
-          '57P01', //	admin_shutdown
-          '57P02', //	crash_shutdown
-          '57P03', //	cannot_connect_now
-          '58030', //	io_error
-          '40P01', // deadlock_detected
-          '40001', // serialization_failure
-          '55P03', // lock_not_available
-          '57014', // query_canceled (includes lock_timeout)
-        }.contains(error.code);
-      }
-
-      // Lastly, try by searching for specific keywords in the error message
+      // Client-side errors (e.g. closed connection): search for specific keywords in the message
       final msg = error.message.toLowerCase();
-      if (msg.contains('connection') &&
-          (msg.contains('closed') || msg.contains('terminated') || msg.contains('reset') || msg.contains('broken'))) {
-        return true;
-      }
+      return msg.contains('connection') &&
+          (msg.contains('closed') || msg.contains('terminated') || msg.contains('reset') || msg.contains('broken'));
     }
 
     return false;
@@ -56,122 +62,142 @@ class PostgresMigrator with Migratable {
 
   @override
   Future<void> acquireLock() async {
-    await _conn.execute(
-      Sql.named('SELECT pg_advisory_lock(@lock_key:bigint)'),
-      parameters: {'lock_key': _advisoryLockKey(options.lockKey)},
-    );
+    final deadline = DateTime.now().add(options.timeout);
+
+    while (true) {
+      final result = await _conn.execute(
+        Sql.named('SELECT pg_try_advisory_lock(hashtext(@lock_key))'),
+        parameters: {'lock_key': options.lockKey},
+        timeout: options.timeout,
+      );
+      if (result.first.first == true) return;
+
+      if (DateTime.now().isAfter(deadline)) {
+        throw TimeoutException('Could not acquire migration lock "${options.lockKey}"', options.timeout);
+      }
+      await Future.delayed(const Duration(milliseconds: 200));
+    }
   }
 
   @override
   Future<void> releaseLock() async {
-    await _conn.execute(
-      Sql.named('SELECT pg_advisory_unlock(@lock_key:bigint)'),
-      parameters: {'lock_key': _advisoryLockKey(options.lockKey)},
+    final result = await _conn.execute(
+      Sql.named('SELECT pg_advisory_unlock(hashtext(@lock_key))'),
+      parameters: {'lock_key': options.lockKey},
+      timeout: options.timeout,
     );
+    if (result.first.first != true) {
+      throw StateError('Migration lock "${options.lockKey}" was not held by this session');
+    }
   }
 
   @override
   Future<void> transaction(Future<dynamic> Function(TxSession ctx) fn) async {
-    await _conn.runTx(fn);
+    await _conn.runTx((ctx) async {
+      // Make unqualified names in migration files resolve against the configured schema
+      await ctx.execute('SET LOCAL search_path TO "${options.schema}", public', queryMode: QueryMode.simple);
+      return await fn(ctx);
+    });
   }
 
   @override
   Future<dynamic> execute(Object obj, {Map<String, dynamic> params = const {}, dynamic ctx}) async {
-    if (ctx == null || ctx is! TxSession) throw ArgumentError('ctx is not a TxSession instance');
-    if (params.isNotEmpty && obj is! String) throw ArgumentError('when params are given, then obj has to be a string');
+    // A null context means we are not inside a transaction
+    if (ctx != null && ctx is! TxSession) throw ArgumentError('ctx is not a TxSession instance');
+    if (obj is! String) throw ArgumentError('obj has to be a String');
 
+    final session = (ctx as TxSession?) ?? _conn;
     if (params.isNotEmpty) {
-      await ctx.execute(Sql.named(obj as String), parameters: params);
+      await session.execute(Sql.named(obj), parameters: params);
     } else {
-      await ctx.execute(obj, queryMode: QueryMode.simple);
+      // Simple query mode allows migration files to contain multiple statements
+      await session.execute(obj, queryMode: QueryMode.simple);
     }
   }
 
   @override
   Future<({String version, String checksum})?> queryVersion() async {
     try {
-      final sql = 'SELECT version, checksum FROM $versionTable ORDER BY id DESC LIMIT 1';
-      final result = await _conn.execute(sql);
-      final row = result.isEmpty ? {} : result.first.toColumnMap();
+      final result = await _conn.execute(
+        'SELECT version, checksum FROM $versionTable ORDER BY id DESC LIMIT 1',
+        timeout: options.timeout,
+      );
+      if (result.isEmpty) return (version: '', checksum: '');
 
+      final row = result.first.toColumnMap();
       return (version: row['version'] as String? ?? '', checksum: row['checksum'] as String? ?? '');
-    } catch (e) {
-      if (!isRetryable(e)) {
-        String sql =
-            """
-            CREATE TABLE IF NOT EXISTS ${options.schema}.${options.versionTable} (
-                 id           BIGSERIAL PRIMARY KEY,
-                 version      VARCHAR NOT NULL,
-                 checksum     VARCHAR NOT NULL,
-                 started_at   TIMESTAMP WITH TIME ZONE NOT NULL,
-                 completed_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                 direction    VARCHAR NOT NULL CHECK (direction IN ('up', 'down')),
-                 comments     VARCHAR
-            )
-        """;
-        await _conn.execute(sql);
-
-        sql =
-            """
-            CREATE INDEX IF NOT EXISTS idx_${options.versionTable}_version ON ${options.schema}.${options.versionTable} (version);
-            """;
-        await _conn.execute(sql);
-
-        return (version: Migratable.minVersion, checksum: '');
-      }
-
-      rethrow;
+    } on ServerException catch (e) {
+      // Only a missing table (or schema) means the version table has to be created
+      if (e.code != '42P01' && e.code != '3F000') rethrow;
     }
+
+    try {
+      // Runs as one implicit transaction (simple query mode)
+      await _conn.execute(
+        """CREATE SCHEMA IF NOT EXISTS "${options.schema}";
+           CREATE TABLE IF NOT EXISTS $versionTable (
+             id           BIGSERIAL PRIMARY KEY,
+             version      VARCHAR NOT NULL,
+             checksum     VARCHAR NOT NULL,
+             started_at   TIMESTAMP WITH TIME ZONE NOT NULL,
+             completed_at TIMESTAMP WITH TIME ZONE NOT NULL,
+             direction    VARCHAR NOT NULL CHECK (direction IN ('up', 'down')),
+             comments     VARCHAR
+           );
+           CREATE INDEX IF NOT EXISTS "idx_${options.versionTable}_version" ON $versionTable (version);""",
+        queryMode: QueryMode.simple,
+      );
+    } on ServerException catch (e) {
+      // Tolerate concurrent creation: duplicate schema/object, or pg_type unique violation
+      if (!const {'23505', '42P06', '42P07'}.contains(e.code)) rethrow;
+    }
+
+    return (version: '', checksum: '');
   }
 
   @override
   Future<void> saveVersion({required MigrationResult result, dynamic ctx, String? comment}) async {
-    if (ctx == null || ctx is! TxSession) throw ArgumentError('ctx is not a TxSession instance');
+    if (ctx != null && ctx is! TxSession) throw ArgumentError('ctx is not a TxSession instance');
 
-    final sql =
-        """INSERT INTO ${options.schema}.${options.versionTable} (version, checksum, started_at, completed_at, direction, comments)
+    final sql = """INSERT INTO $versionTable (version, checksum, started_at, completed_at, direction, comments)
            VALUES (@version, @checksum, @started_at, @completed_at, @direction, @comments)""";
 
-    await ctx.execute(
+    await ((ctx as TxSession?) ?? _conn).execute(
       Sql.named(sql),
       parameters: {
         'version': result.toVersion,
         'checksum': result.checksum,
-        'started_at': result.started,
-        'completed_at': result.completed,
+        'started_at': result.started.toUtc(),
+        'completed_at': result.completed.toUtc(),
         'direction': result.direction == MigrationDirection.down ? 'down' : 'up',
         'comments': comment,
       },
       timeout: options.timeout,
     );
   }
-
-  // region Internal methods
-  int _advisoryLockKey(String input) {
-    final digest = sha256.convert(utf8.encode(input)).bytes;
-    // Take first 8 bytes as signed 64-bit integer
-    var value = 0;
-    for (var i = 0; i < 8; i++) {
-      value = (value << 8) | digest[i];
-    }
-    return value;
-  }
-
-  // endregion
 }
 
 class PsqlMigrationOptions extends MigrationOptions {
+  /// [schema] and [versionTable] must be proper PostgreSQL identifier names (they are double-quoted but not escaped).
+  /// [versionTable] is limited to 51 characters, so that the derived index name fits PostgreSQL's 63-byte limit.
   PsqlMigrationOptions({
     required super.path,
+    String schema = 'public',
     super.filesPattern,
     super.directoryBased,
-    super.schema = 'public',
-    super.versionTable,
+    String versionTable = '_version',
     super.retries,
     super.retryDelay,
     super.timeout,
     super.checksums,
     super.encoding,
-  }) : assert(schema.isNotEmpty, 'schema must not be empty'),
-       assert(versionTable.isNotEmpty, 'version table must not be empty');
+    super.lockKey,
+  }) : super(
+         schema: schema.trim().isEmpty ? throw ArgumentError.value(schema, 'schema', 'must not be empty') : schema,
+         versionTable: versionTable.trim().isEmpty
+             ? throw ArgumentError.value(versionTable, 'versionTable', 'must not be empty')
+             : versionTable.length > 51
+             ? throw ArgumentError.value(versionTable, 'versionTable', 'must not exceed 51 characters')
+             : versionTable,
+       );
 }
